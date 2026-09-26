@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/FalconChristmas/fpp-plugin-Template/master/pluginInfo.schema.json",
+  "repoName": "fpp-festivly",
+  "name": "Festivly",
+  "author": "Festivly",
+  "description": "Push live on/off status, the current song, and nightly schedule hours to your festivly.app listing. Visitors can request the next song from the listing while the show is playing.",
+  "homeURL": "https://festivly.app/help/display-setup",
+  "srcURL": "https://github.com/Smith-Happens/fpp-festivly.git",
+  "bugURL": "https://github.com/Smith-Happens/fpp-festivly/issues",
+  "documentation": "https://festivly.app/help/display-setup#fpp-falcon-player-live-onoff-status",
+  "allowUpdates": 1,
+  "releaseNotesStyle": "gitHistory",
+  "privacy": {
+    "summary": "Sends this player's playlist start/stop, current song title, and schedule hours to the festivly.app listing you configure. The signing token stays on this device.",
+    "sends": [
+      "display id",
+      "playing or idle",
+      "current song title and artist",
+      "next song title",
+      "seconds remaining",
+      "schedule start/stop times and days"
+    ],
+    "collects": [
+      "Festivly display id and signing token, stored in this player's config"
+    ],
+    "sensors": [],
+    "remoteAccess": "outbound HTTPS to www.festivly.com (festivly.app redirects there)",
+    "systemChanges": [
+      "adds a minutely cron entry for the fpp user to poll Festivly for song requests"
+    ],
+    "closedCode": false,
+    "other": "none"
+  },
+  "versions": [
+    {
+      "minFPPVersion": "8.0",
+      "maxFPPVersion": "0",
+      "branch": "main",
+      "sha": ""
+    }
+  ]
+}

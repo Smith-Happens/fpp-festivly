@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""Festivly callback for Falcon Player.
+
+FPP runs this as `callbacks --list` and as
+`callbacks --type playlist|media --data '<json>'`.
+`--sync` sends the current player status on demand from the settings page.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CONFIG = os.environ.get(
+    "FESTIVLY_CONFIG",
+    "/home/fpp/media/config/plugin.fpp-festivly.json",
+)
+DEFAULT_WEBHOOK = "https://www.festivly.com/api/fpp/webhook"
+DEFAULT_CONTROL = "https://www.festivly.com/api/fpp/control"
+MEDIA_EXTS = (".fseq", ".mp3", ".mp4", ".wav", ".m4a", ".ogg")
+# Claim the next request this many seconds before the current sequence ends.
+HANDOFF_LEAD_SECONDS = 5
+def _default_handoff_lock():
+    media = os.environ.get("MEDIADIR", "/home/fpp/media")
+    return os.path.join(media, "tmp", "festivly-fpp-handoff.lock")
+
+
+HANDOFF_LOCK = os.environ.get("FESTIVLY_HANDOFF_LOCK", _default_handoff_lock())
+
+
+def load_config():
+    try:
+        with open(CONFIG, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    display_id = data.get("displayId")
+    token = data.get("token")
+    if not isinstance(display_id, str) or not display_id.strip():
+        return None
+    if not isinstance(token, str) or not token.strip():
+        return None
+    data["displayId"] = display_id.strip()
+    data["token"] = token.strip()
+    return data
+
+
+def pretty_song(value):
+    if not isinstance(value, str):
+        return None
+    base = value.replace("\\", "/").split("/")[-1]
+    lower = base.lower()
+    for ext in MEDIA_EXTS:
+        if lower.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    cleaned = " ".join(base.replace("_", " ").split()).strip()
+    return cleaned[:120] or None
+
+
+def fetch_json(url):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def song_from_media(data):
+    if not isinstance(data, dict):
+        return None, None
+    title = data.get("title") or data.get("Media") or data.get("Sequence")
+    return pretty_song(title), pretty_song(data.get("artist"))
+
+
+def control_url(config):
+    webhook = config.get("webhookUrl")
+    if isinstance(webhook, str) and webhook.endswith("/api/fpp/webhook"):
+        return webhook[: -len("/api/fpp/webhook")] + "/api/fpp/control"
+    return DEFAULT_CONTROL
+
+
+def post_signed(config, url, payload):
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    timestamp = str(int(time.time()))
+    digest = hmac.new(
+        config["token"].encode("utf-8"),
+        timestamp.encode("utf-8") + b"." + body,
+        hashlib.sha256,
+    ).hexdigest()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-FPP-Timestamp": timestamp,
+            "X-FPP-Signature": "sha256=" + digest,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=8) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    sys.stdout.write(raw)
+    sys.stdout.write("\n")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def post(config, payload):
+    webhook = config.get("webhookUrl")
+    if not isinstance(webhook, str) or not webhook.startswith("https://"):
+        webhook = DEFAULT_WEBHOOK
+    return post_signed(config, webhook, payload)
+
+
+def read_seconds_remaining(live):
+    if not isinstance(live, dict):
+        return None
+    for key in ("seconds_remaining", "secondsRemaining"):
+        value = live.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    clock = live.get("time_remaining")
+    if isinstance(clock, str) and ":" in clock:
+        parts = clock.split(":")
+        try:
+            numbers = [int(part) for part in parts]
+        except ValueError:
+            return None
+        if len(numbers) == 2:
+            return numbers[0] * 60 + numbers[1]
+        if len(numbers) == 3:
+            return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+    return None
+
+
+def next_title(live):
+    if not isinstance(live, dict):
+        return None
+    for key in ("next_sequence", "nextSequence", "next_song", "nextSong"):
+        title = pretty_song(live.get(key) if isinstance(live.get(key), str) else "")
+        if title:
+            return title
+    current = live.get("current_playlist")
+    playlist = current.get("playlist") if isinstance(current, dict) else None
+    if not isinstance(playlist, str) or not playlist:
+        return None
+    quoted = urllib.parse.quote(playlist, safe="")
+    data = fetch_json("http://127.0.0.1/api/playlist/" + quoted)
+    entries = data.get("mainPlaylist") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+    current_raw = live.get("current_sequence") or live.get("current_song") or ""
+    current_name = current_raw if isinstance(current_raw, str) else ""
+    current_base = current_name.replace("\\", "/").split("/")[-1]
+    position = None
+    for index, entry in enumerate(entries):
+        sequence = entry_sequence(entry)
+        if not sequence:
+            continue
+        base = sequence.replace("\\", "/").split("/")[-1]
+        if sequence == current_name or base == current_base:
+            position = index
+            break
+    if position is None:
+        raw_index = current.get("index") if isinstance(current, dict) else None
+        try:
+            position = int(raw_index)
+        except (TypeError, ValueError):
+            return None
+    nxt = position + 1
+    if nxt < 0 or nxt >= len(entries):
+        return None
+    return pretty_song(entry_sequence(entries[nxt]) or "")
+
+
+def build_payload(config, status, song, artist, sequence_name=None, live=None, include_schedule=True):
+    payload = {"displayId": config["displayId"], "status": status}
+    if status == "idle":
+        payload["currentSong"] = None
+        payload["currentArtist"] = None
+        payload["nextSong"] = None
+        payload["secondsRemaining"] = None
+    else:
+        if song:
+            payload["currentSong"] = song
+        if artist:
+            payload["currentArtist"] = artist
+        if sequence_name:
+            payload["sequenceName"] = sequence_name
+        if isinstance(live, dict):
+            remaining = read_seconds_remaining(live)
+            if remaining is not None:
+                payload["secondsRemaining"] = remaining
+            upcoming = next_title(live)
+            if upcoming:
+                payload["nextSong"] = upcoming
+    if include_schedule and config.get("syncSchedule", 1) not in (0, False, "0"):
+        schedule = fetch_json("http://127.0.0.1/api/schedule")
+        if isinstance(schedule, list):
+            payload["scheduleEntries"] = schedule
+    return payload
+
+
+def entry_sequence(entry):
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("enabled") in (0, False, "0"):
+        return None
+    sequence = entry.get("sequenceName")
+    nested = entry.get("sequence")
+    if not isinstance(sequence, str) and isinstance(nested, dict):
+        sequence = nested.get("sequenceName")
+    if isinstance(sequence, str) and sequence.strip():
+        return sequence.strip()
+    media = entry.get("mediaName") or entry.get("mediaFilename")
+    nested_media = entry.get("media")
+    if not isinstance(media, str) and isinstance(nested_media, dict):
+        media = nested_media.get("mediaFilename") or nested_media.get("mediaName")
+    if isinstance(media, str) and media.strip():
+        return media.strip()
+    return None
+
+
+def playlist_names():
+    data = fetch_json("http://127.0.0.1/api/playlists")
+    names = data
+    if isinstance(data, dict):
+        names = data.get("playlists") or data.get("data") or []
+    if not isinstance(names, list):
+        return []
+    found = []
+    for item in names:
+        if isinstance(item, str) and item:
+            found.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("name"), str):
+            found.append(item["name"])
+    return found
+
+
+def collect_playlist():
+    songs = []
+    locations = {}
+    for name in playlist_names():
+        quoted = urllib.parse.quote(name, safe="")
+        data = fetch_json("http://127.0.0.1/api/playlist/" + quoted)
+        entries = data.get("mainPlaylist") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries, start=1):
+            sequence = entry_sequence(entry)
+            if not sequence or sequence in locations:
+                continue
+            title = pretty_song(sequence) or sequence
+            songs.append({"sequenceName": sequence, "title": title})
+            locations[sequence] = (name, index)
+    return songs, locations
+
+
+def insert_after_current(playlist, index):
+    body = json.dumps(
+        {
+            "command": "Insert Playlist After Current",
+            "args": [playlist, str(index), str(index), "false"],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1/api/command",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as resp:
+        resp.read()
+
+
+def claim_and_insert(config, locations):
+    claimed = post_signed(
+        config,
+        control_url(config),
+        {"displayId": config["displayId"], "action": "claimNext"},
+    )
+    request = claimed.get("request") if isinstance(claimed, dict) else None
+    if not isinstance(request, dict):
+        return
+    sequence = request.get("sequenceName")
+    request_id = request.get("id")
+    spot = locations.get(sequence) if isinstance(sequence, str) else None
+    if not isinstance(request_id, str):
+        return
+    if not spot:
+        post_signed(
+            config,
+            control_url(config),
+            {
+                "displayId": config["displayId"],
+                "action": "updateRequest",
+                "requestId": request_id,
+                "status": "failed",
+            },
+        )
+        return
+    playlist, index = spot
+    insert_after_current(playlist, index)
+
+
+def sync_library(config, songs):
+    post_signed(
+        config,
+        control_url(config),
+        {"displayId": config["displayId"], "action": "syncLibrary", "songs": songs},
+    )
+
+
+def handoff_pending():
+    try:
+        with open(HANDOFF_LOCK, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        fire_at = float(data.get("fireAt", 0))
+        pid = int(data.get("pid", 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if fire_at < time.time() - 2:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def arm_handoff(wait_seconds):
+    if handoff_pending():
+        return
+    wait_seconds = max(0, min(int(wait_seconds), 70))
+    env = os.environ.copy()
+    env["FESTIVLY_HANDOFF_WAIT"] = str(wait_seconds)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--handoff"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        os.makedirs(os.path.dirname(HANDOFF_LOCK), exist_ok=True)
+        with open(HANDOFF_LOCK, "w", encoding="utf-8") as handle:
+            json.dump({"fireAt": time.time() + wait_seconds, "pid": proc.pid}, handle)
+    except OSError:
+        pass
+
+
+def consider_claim(config, live, locations):
+    name = str((live or {}).get("status_name") or "").lower()
+    playing = name in ("playing", "paused")
+    remaining = read_seconds_remaining(live)
+    if not playing:
+        return
+    # Older players omit the timer. Claim on the minute so requests still move.
+    if remaining is None or remaining <= HANDOFF_LEAD_SECONDS:
+        claim_and_insert(config, locations)
+        return
+    wait = remaining - HANDOFF_LEAD_SECONDS
+    if wait > 70:
+        return
+    arm_handoff(wait)
+
+
+def poll_requests(config, live):
+    songs, locations = collect_playlist()
+    sync_library(config, songs)
+    consider_claim(config, live, locations)
+
+
+def run_handoff(config):
+    wait = 0
+    raw_wait = os.environ.get("FESTIVLY_HANDOFF_WAIT", "0")
+    try:
+        wait = int(raw_wait)
+    except ValueError:
+        wait = 0
+    if wait > 0:
+        time.sleep(min(wait, 70))
+    live = fetch_json("http://127.0.0.1/api/fppd/status") or {}
+    name = str(live.get("status_name") or "").lower()
+    playing = name in ("playing", "paused")
+    remaining = read_seconds_remaining(live)
+    if not playing:
+        return 0
+    # A long timer means a new sequence started. The next poll will arm again.
+    if remaining is not None and remaining > HANDOFF_LEAD_SECONDS + 3:
+        return 0
+    _songs, locations = collect_playlist()
+    claim_and_insert(config, locations)
+    raw = live.get("current_sequence") or live.get("current_song")
+    sequence_name = raw if isinstance(raw, str) and raw.strip() else None
+    song = pretty_song(sequence_name or "")
+    post(config, build_payload(config, "playing", song, None, sequence_name, live, False))
+    return 0
+
+
+def raw_sequence_name(data):
+    if not isinstance(data, dict):
+        return None
+    for key in ("Sequence", "Media"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def parse_invocation(argv):
+    kind = None
+    data = None
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--type" and index + 1 < len(argv):
+            kind = argv[index + 1]
+            index += 2
+        elif arg == "--data" and index + 1 < len(argv):
+            data = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    parsed = None
+    if data:
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            parsed = None
+    return kind, parsed
+
+
+def main(argv):
+    if "--list" in argv:
+        print("playlist,media")
+        return 0
+
+    config = load_config()
+    if config is None:
+        print("Festivly: save a display id and token first", file=sys.stderr)
+        return 0
+
+    if "--handoff" in argv:
+        try:
+            return run_handoff(config)
+        except Exception as exc:
+            print("Festivly: %s" % exc, file=sys.stderr)
+            return 1
+
+    kind, parsed = parse_invocation(argv)
+    polling = "--poll" in argv or "--sync" in argv
+    status = "playing"
+    song = None
+    artist = None
+    sequence_name = None
+    send_status = True
+    live = None
+
+    if kind == "playlist" and isinstance(parsed, dict):
+        action = str(parsed.get("Action") or "").lower()
+        status = "idle" if action == "stop" else "playing"
+        if status == "playing":
+            live = fetch_json("http://127.0.0.1/api/fppd/status") or {}
+    elif kind == "media":
+        # Local status only. Claiming a request here would block FPP's callback.
+        status = "playing"
+        live = fetch_json("http://127.0.0.1/api/fppd/status") or {}
+        sequence_name = raw_sequence_name(parsed)
+        song, artist = song_from_media(parsed)
+        if not song:
+            song = pretty_song(live.get("current_sequence") or live.get("current_song") or "")
+            if not sequence_name:
+                raw = live.get("current_sequence") or live.get("current_song")
+                sequence_name = raw if isinstance(raw, str) and raw.strip() else None
+    elif polling:
+        live = fetch_json("http://127.0.0.1/api/fppd/status") or {}
+        name = str(live.get("status_name") or "").lower()
+        status = "playing" if name in ("playing", "paused") else "idle"
+        raw = live.get("current_sequence") or live.get("current_song")
+        sequence_name = raw if isinstance(raw, str) and raw.strip() else None
+        song = pretty_song(sequence_name or "")
+        artist = None
+    else:
+        send_status = False
+
+    try:
+        if send_status:
+            post(config, build_payload(config, status, song, artist, sequence_name, live))
+        if polling:
+            poll_requests(config, live)
+    except Exception as exc:
+        print("Festivly: %s" % exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
