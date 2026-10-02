@@ -1,5 +1,4 @@
 {
-  "$schema": "https://raw.githubusercontent.com/FalconChristmas/fpp-plugin-Template/master/pluginInfo.schema.json",
   "repoName": "fpp-festivly",
   "name": "Festivly",
   "author": "Festivly",
@@ -13,12 +12,12 @@
   "privacy": {
     "summary": "Sends this player's playlist start/stop, current song title, and schedule hours to the festivly.app listing you configure. The signing token stays on this device.",
     "sends": [
-      "display id",
-      "playing or idle",
-      "current song title and artist",
-      "next song title",
-      "seconds remaining",
-      "schedule start/stop times and days"
+      {
+        "to": "www.festivly.com",
+        "what": "Display ID (user-configured identifier), player status (playing/idle), current song title and artist, current sequence name, next song title, seconds remaining in current song, nightly schedule entries (start/stop times and days of week)",
+        "why": "To update the public Festivly listing with real-time show status and enable visitors to request songs from the available playlist. Schedule sync allows the listing to show when the show is expected to run.",
+        "alwaysOn": true
+      }
     ],
     "collects": [
       "Festivly display id and signing token, stored in this player's config"
@@ -34,6 +33,12 @@
   "versions": [
     {
       "minFPPVersion": "8.0",
+      "maxFPPVersion": "0",
+      "branch": "main",
+      "sha": ""
+    },
+    {
+      "minFPPVersion": "10.0",
       "maxFPPVersion": "0",
       "branch": "main",
       "sha": ""
