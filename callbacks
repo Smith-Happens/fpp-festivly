@@ -22,6 +22,9 @@ CONFIG = os.environ.get(
 )
 DEFAULT_WEBHOOK = "https://www.festivly.com/api/fpp/webhook"
 DEFAULT_CONTROL = "https://www.festivly.com/api/fpp/control"
+# Cloudflare's bot protection on festivly.com 403s the default
+# "Python-urllib/x.y" agent before the request reaches the app.
+USER_AGENT = "fpp-festivly (+https://festivly.app/help/display-setup)"
 MEDIA_EXTS = (".fseq", ".mp3", ".mp4", ".wav", ".m4a", ".ogg")
 # Claim the next request this many seconds before the current sequence ends.
 HANDOFF_LEAD_SECONDS = 5
@@ -103,6 +106,7 @@ def post_signed(config, url, payload):
             "Content-Type": "application/json",
             "X-FPP-Timestamp": timestamp,
             "X-FPP-Signature": "sha256=" + digest,
+            "User-Agent": USER_AGENT,
         },
     )
     with urllib.request.urlopen(request, timeout=8) as resp:
