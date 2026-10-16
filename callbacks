@@ -27,7 +27,10 @@ DEFAULT_CONTROL = "https://www.festivly.com/api/fpp/control"
 USER_AGENT = "fpp-festivly (+https://festivly.app/help/display-setup)"
 MEDIA_EXTS = (".fseq", ".mp3", ".mp4", ".wav", ".m4a", ".ogg")
 # Claim the next request this many seconds before the current sequence ends.
-HANDOFF_LEAD_SECONDS = 5
+# FPP commits to the next playlist item a few seconds early (media
+# pre-buffering, e.g. PulseMesh), so an insert 5s before the end landed one
+# song late. 20s leaves room for the claim round-trip and that lookahead.
+HANDOFF_LEAD_SECONDS = 20
 def _default_handoff_lock():
     media = os.environ.get("MEDIADIR", "/home/fpp/media")
     return os.path.join(media, "tmp", "festivly-fpp-handoff.lock")
@@ -258,7 +261,14 @@ def playlist_names():
 def collect_playlist():
     songs = []
     locations = {}
-    for name in playlist_names():
+    # Prefer the running playlist: a sequence can also sit in single-song
+    # playlists (e.g. Home Assistant's "HA - <song>"), which sort first.
+    live = fetch_json("http://127.0.0.1/api/fppd/status") or {}
+    running = (live.get("current_playlist") or {}).get("playlist") or ""
+    names = playlist_names()
+    if running in names:
+        names = [running] + [n for n in names if n != running]
+    for name in names:
         quoted = urllib.parse.quote(name, safe="")
         data = fetch_json("http://127.0.0.1/api/playlist/" + quoted)
         entries = data.get("mainPlaylist") if isinstance(data, dict) else None
