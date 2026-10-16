@@ -274,7 +274,11 @@ def collect_playlist():
         entries = data.get("mainPlaylist") if isinstance(data, dict) else None
         if not isinstance(entries, list):
             continue
-        for index, entry in enumerate(entries, start=1):
+        # FPP's insert start/end items count across leadIn + mainPlaylist +
+        # leadOut, so a show playlist with a lead-in ("Show Open") was off by
+        # one and the song before the request played instead.
+        lead_in = data.get("leadIn") if isinstance(data.get("leadIn"), list) else []
+        for index, entry in enumerate(entries, start=len(lead_in) + 1):
             sequence = entry_sequence(entry)
             if not sequence or sequence in locations:
                 continue
